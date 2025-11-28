@@ -11,11 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/miyantara7/utils-master/validator"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
@@ -342,6 +344,8 @@ func (c *Modules) createMsg(level interfaces.LogLevel,
 	for _, s := range input {
 		if val, ok := s.([]any); ok {
 			inp = append(inp, val...)
+		} else {
+			inp = append(inp, s)
 		}
 	}
 
@@ -354,8 +358,14 @@ func (c *Modules) createMsg(level interfaces.LogLevel,
 		ffs = val.Error()
 		msGs = fmt.Sprintf(ffs, inp...)
 	} else {
-		msGs = format
+		if len(inp) > 0 {
+			msGs = fmt.Sprintf("%v %v", format, inp)
+		} else {
+			msGs = format
+		}
 	}
+
+	messageStr := fmt.Sprintf("%v", msGs)
 
 	return interfaces.LoggerMessage{
 		ID:        hash.CreateRandomId(10),
@@ -365,7 +375,7 @@ func (c *Modules) createMsg(level interfaces.LogLevel,
 		File:      caller.File,
 		Line:      caller.Line,
 		FuncName:  caller.FName,
-		Message:   msGs,
+		Message:   messageStr,
 	}
 }
 
@@ -387,30 +397,56 @@ func (c *Modules) createJsonMsg(msg interfaces.LoggerMessage, print bool) (res [
 	jsonOut := make(map[string]any)
 	jsonOut["logId"] = msg.ID
 	jsonOut["level"] = strings.ToLower(msg.LevelName)
-	jsonOut["time"] = msg.Time.Format("2006-01-02T15:04:05.000-0700")
+	// gunakan RFC3339Nano agar timezone + precision tersimpan
+	jsonOut["time"] = msg.Time.Format(time.RFC3339Nano)
 
+	// caller safe
 	jsonOut["caller"] = fmt.Sprintf("%s:%d", msg.File, msg.Line)
 
-	vv := reflect.TypeOf(msg.Message)
-	switch vv.Kind() {
-	case reflect.String:
-		jsonOut["message"] = msg.Message
-	case reflect.Map:
-		if val, ok := msg.Message.(map[string]any); ok {
-			for kk, vv := range val {
+	// MESSAGE: handle nil and varied kinds safely
+	if msg.Message == nil {
+		jsonOut["message"] = ""
+	} else {
+		vv := reflect.TypeOf(msg.Message)
+		if vv != nil && vv.Kind() == reflect.String {
+			jsonOut["message"] = msg.Message
+		} else if m, ok := msg.Message.(map[string]any); ok {
+			for kk, vv := range m {
+				// jangan overwrite top-level reserved keys
+				if kk == "logId" || kk == "level" || kk == "time" || kk == "caller" {
+					continue
+				}
 				jsonOut[kk] = vv
 			}
-		} else if val, ok := msg.Message.(map[string]string); ok {
-			for kk, vv := range val {
+		} else if m, ok := msg.Message.(map[string]string); ok {
+			for kk, vv := range m {
+				if kk == "logId" || kk == "level" || kk == "time" || kk == "caller" {
+					continue
+				}
 				jsonOut[kk] = vv
 			}
 		} else {
-			jsonOut["message"] = msg.Message
+			// fallback: marshal arbitrary object
+			if b, err := json.Marshal(msg.Message); err == nil {
+				jsonOut["message"] = string(b)
+			} else {
+				// fallback to fmt.Sprintf
+				jsonOut["message"] = fmt.Sprintf("%v", msg.Message)
+			}
 		}
-	default:
-		jsonOut["message"] = msg.Message
 	}
 
+	// add trace/span metadata if present in the message
+	if meta := extractMetaFromMsg(msg); len(meta) > 0 {
+		for k, v := range meta {
+			// don't overwrite the main keys
+			if _, exists := jsonOut[k]; !exists {
+				jsonOut[k] = v
+			}
+		}
+	}
+
+	// marshal
 	if val, err := json.Marshal(jsonOut); err == nil {
 		if print {
 			ssd := string(val)
@@ -423,10 +459,127 @@ func (c *Modules) createJsonMsg(msg interfaces.LoggerMessage, print bool) (res [
 			}
 		}
 		return val
-
 	}
 
 	return res
+}
+
+// It is defensive: if fields are absent, it returns an empty map.
+func extractMetaFromMsg(msg interfaces.LoggerMessage) map[string]any {
+	out := map[string]any{}
+
+	v := reflect.ValueOf(msg)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return out
+	}
+
+	// check TraceID field
+	if f := v.FieldByName("TraceID"); f.IsValid() && f.Kind() == reflect.String {
+		if s := f.String(); s != "" {
+			out["trace_id"] = s
+		}
+	}
+	// check SpanID field
+	if f := v.FieldByName("SpanID"); f.IsValid() && f.Kind() == reflect.String {
+		if s := f.String(); s != "" {
+			out["span_id"] = s
+		}
+	}
+	// check Meta map[string]any
+	if f := v.FieldByName("Meta"); f.IsValid() && !f.IsZero() {
+		if mm, ok := f.Interface().(map[string]any); ok {
+			for k, vv := range mm {
+				out[k] = vv
+			}
+		}
+	}
+	// also check for common keys inside Message if message is map
+	if mv := reflect.ValueOf(msg.Message); mv.IsValid() && mv.Kind() == reflect.Map {
+		if mm, ok := msg.Message.(map[string]any); ok {
+			if val, ok := mm["trace_id"]; ok {
+				out["trace_id"] = val
+			}
+			if val, ok := mm["span_id"]; ok {
+				out["span_id"] = val
+			}
+		}
+	}
+
+	return out
+}
+
+func attachTraceToMsg(ctx context.Context, msg *interfaces.LoggerMessage) {
+	if ctx == nil || msg == nil {
+		return
+	}
+	span := trace.SpanFromContext(ctx)
+	if span == nil {
+		return
+	}
+	sc := span.SpanContext()
+	if !sc.IsValid() {
+		return
+	}
+
+	// set TraceID and SpanID if fields exist, otherwise put into Meta map if present
+	setFieldInMsg(msg, "TraceID", sc.TraceID().String())
+	setFieldInMsg(msg, "SpanID", sc.SpanID().String())
+
+	// Also set datadog lower-64bits decimal if convertible
+	if dd := ConvertTraceIDToDatadogFormat(sc.TraceID().String()); dd != "" {
+		setFieldInMsg(msg, "datadog_trace_id", dd)
+	}
+}
+
+// If the field does not exist, it will attempt to put into Meta map field if available.
+func setFieldInMsg(msg *interfaces.LoggerMessage, name string, value any) {
+	if msg == nil {
+		return
+	}
+	v := reflect.ValueOf(msg)
+	if v.Kind() != reflect.Ptr {
+		return
+	}
+	v = v.Elem()
+	if v.Kind() != reflect.Struct {
+		return
+	}
+
+	// try direct field set
+	if f := v.FieldByName(name); f.IsValid() && f.CanSet() {
+		switch f.Kind() {
+		case reflect.String:
+			f.SetString(fmt.Sprintf("%v", value))
+			return
+		}
+	}
+
+	// fallback: attempt to set Meta field if it exists and is a map[string]any
+	if f := v.FieldByName("Meta"); f.IsValid() && f.CanSet() {
+		if f.IsNil() {
+			// initialize meta map
+			newMap := map[string]any{}
+			f.Set(reflect.ValueOf(newMap))
+		}
+		if meta, ok := f.Interface().(map[string]any); ok {
+			meta[name] = value
+			f.Set(reflect.ValueOf(meta))
+			return
+		}
+	}
+
+	// final fallback: if there's no Meta field, try Message if it's map[string]any
+	if mv := reflect.ValueOf(v.FieldByName("Message").Interface()); mv.IsValid() && mv.Kind() == reflect.Map {
+		if mm, ok := v.FieldByName("Message").Interface().(map[string]any); ok {
+			mm[name] = value
+			// set back
+			v.FieldByName("Message").Set(reflect.ValueOf(mm))
+			return
+		}
+	}
 }
 
 func (c *Modules) store(msg interfaces.LoggerMessage, raw string) {
@@ -606,6 +759,25 @@ func (c *Modules) Clean() interfaces.Logger {
 	return c
 }
 
-func (c *Modules) Kill() {
+func (c *Modules) Kill() {}
 
+func ConvertTraceIDToDatadogFormat(id string) string {
+	if len(id) == 0 {
+		return ""
+	}
+	// normalize: remove optional 0x
+	if strings.HasPrefix(id, "0x") || strings.HasPrefix(id, "0X") {
+		id = id[2:]
+	}
+	// target last 16 hex chars (lower 64 bits)
+	if len(id) > 16 {
+		id = id[len(id)-16:]
+	} else if len(id) < 16 {
+		id = strings.Repeat("0", 16-len(id)) + id
+	}
+	intValue, err := strconv.ParseUint(id, 16, 64)
+	if err != nil {
+		return ""
+	}
+	return strconv.FormatUint(intValue, 10)
 }
